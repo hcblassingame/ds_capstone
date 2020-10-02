@@ -1,0 +1,218 @@
+---
+title: "Hurricane Track & Intensity Investigation"
+author: "Henry Blassingame"
+date: "9/9/2020"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(gdata)
+library(ggplot2)
+library(gstat)
+library(lubridate)
+library(readr)
+library(maps)
+library(maptools)
+library(RColorBrewer)
+library(gridExtra)
+library(repr)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(MLmetrics)
+library(tidyr)
+library(rgdal)
+library(rgeos)
+library(plotly)
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+## Read and format input data
+``` {r data loading and cleanup, echo=FALSE}
+# Read the data file.
+
+hurricane_data <- read.csv("atlantic_updated.csv", header = TRUE)
+
+# The date and time data is a mess. Let's reformat it into one field:
+
+hurricane_data$Year <- substr(as.character(hurricane_data$Date), 1,4)
+hurricane_data$Month <- substr(as.character(hurricane_data$Date), 5,6)
+hurricane_data$Day <- substr(as.character(hurricane_data$Date), 7,8)
+
+hurricane_data$dateString <- as.Date(paste(hurricane_data$Month, hurricane_data$Day, hurricane_data$Year, sep = "/"), "%m/%d/%Y")
+hurricane_data$timestamp <- as.POSIXct(paste(hurricane_data$dateString, hurricane_data$Time), format = "%Y-%m-%d %H:%M")
+
+coordinates<-(as.data.frame(hurricane_data$Longitude))
+coordinates<-cbind(coordinates, hurricane_data$Latitude)
+out<-subset(coordinates, hurricane_data$Longitude < -100) ##Find the outliers
+
+# Exclude data before 1900
+hurricane_data.new <- hurricane_data[hurricane_data$Year >= 1900,]
+hurricane_data.new$YYYYMM<-as.numeric(do.call(paste, c(hurricane_data.new[c("Year", "Month")], sep = ""))) 
+# Exclude storms with only one record
+hurricane_data.new<-hurricane_data.new[ave(rep(1, nrow(hurricane_data.new)), hurricane_data.new$ID, FUN=length)>1,] 
+
+# define and remove the columns we don't need
+cruft <- c("Date", "dateString", "Event", "Status", "Category", "Minimum.Pressure",  "Low.Wind.NE", "Low.Wind.SE","Low.Wind.SW", "Low.Wind.NW", "Moderate.Wind.NE", "Moderate.Wind.SE","Moderate.Wind.SW", "Moderate.Wind.NW", "High.Wind.NE", "High.Wind.SE","High.Wind.SW", "High.Wind.NW",  "Day")
+
+trimmed_data <- hurricane_data.new[,!(names(hurricane_data) %in% cruft)]
+
+```
+# Create a map of the US Coastline and plot landfall points
+
+```  {r data visualization, echo=FALSE}
+
+usa <- map("state", fill = TRUE, plot=FALSE) 
+IDs <- sapply(strsplit(usa$names, ":"), function(x) x[1])
+usa <- map2SpatialPolygons(usa, IDs=IDs, proj4string=CRS("+proj=longlat +datum=WGS84"))
+
+# FCreate the coastline
+crs  <- CRS("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-110 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m") 
+usa.p<-spTransform(usa, crs)
+usa.p<-gBuffer(usa.p, byid=TRUE, width=1) 
+usa.u<- gUnaryUnion(usa.p)
+usa.l<-as(usa.u,'SpatialLines') 
+crs.new<-CRS(proj4string(usa)) 
+usa.l<-spTransform(usa.l, crs.new)
+
+hurricane_data.ID<-unique(trimmed_data$ID) # Identifying the numbers of hurricanes on the dataset
+storm_landfall<-NULL                       # Initiate a NULL matrix where to store the results recursively 
+
+options(warn=-1)                           # Removing the warning messages coming from the krige function
+for (i in 1:length(hurricane_data.ID)) {
+
+  id.storm<-hurricane_data.ID[i]
+  storm.i<-trimmed_data[trimmed_data$ID==id.storm,]
+  
+  # Transform the Hurricane track into a line
+  storm.c<- data.frame(x=storm.i$Longitude,y=storm.i$Latitude)
+  na.omit(storm.c)
+  coordinates(storm.c)<-~x+y 
+  proj4string(storm.c) <- CRS(proj4string(usa))
+  storm.l <- SpatialLines(list(Lines(list(Line(coordinates(storm.c))),"X")))
+  proj4string(storm.l) <- CRS(proj4string(usa)) ## attributing the coordinate system of the usa map (WGS84) to the ike track
+  
+  # Finding the landfall point of the hurricane (intersection between the track and the US coastline)
+  cross<-gIntersection(storm.l,usa.l)
+  
+  # If there is intersection, identify the wind speed, date (year and month) and State at landfall
+  
+  if (length(cross)>0)
+  {
+    storm.int<-data.frame(x=storm.i$Longitude,y=storm.i$Latitude,wmax=storm.i$Maximum.Wind,tim=storm.i$YYYYMM)
+    colnames(storm.int)<-c("Longitude","Latitude","Max_Speed","YYYYMM")
+    
+    # Convert the event track info into a spatial data frame
+    coordinates(storm.int) <- ~Longitude+Latitude
+    proj4string(storm.int) <- CRS(proj4string(usa))
+    
+    # Compute the interpolated values of the wind speed at landfall
+    landfall.k <- krige(Max_Speed~1, storm.int, cross, debug.level = 0)
+    landfall.w<-landfall.k$var1.pred
+    
+    # Compute the interpolated values of the Year month at landfall
+    landfall.kt <- krige(YYYYMM~1, storm.int, cross, debug.level = 0)
+    landfall.t<-landfall.kt$var1.pred
+    
+    landfall.p<-cbind(cross@coords,landfall.w,landfall.t)
+    colnames(landfall.p)[3:4]<-c("Max.Wind","Time")
+    
+    # IChoose the landfal for the storm with the strongest wind.
+    lfmax.p<-landfall.p[which.max(landfall.p[,3]),]
+    lfmax.p<-t(as.matrix(lfmax.p))
+    lfmax.p[,c("Time")]<-round(lfmax.p[,c("Time")]) ## rounding the time in case the landfall point happens between 2 months
+    
+    # Identifying the state where landfall occurs
+    lfmax.p1<-data.frame(x=lfmax.p[1], y=lfmax.p[2], wmax=lfmax.p[3])
+    coordinates(lfmax.p1)<-~x+y
+    proj4string(lfmax.p1) <- CRS(proj4string(usa))
+    crs  <- CRS("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-110 +x_0=0 +y_0=0 +ellps=GRS80 +datum=NAD83 +units=m") 
+    lfmax.p1_pla<-spTransform(lfmax.p1, crs)
+    usa_pla<-spTransform(usa, crs)
+    dist<-gDistance(lfmax.p1_pla,usa_pla, byid=TRUE)
+    state.name<-rownames(dist)[which.min(dist)]
+    
+    # storm info to append
+    st.info<-storm.i[1,c("ID","Name")]
+    st.info<-cbind(st.info,state.name,lfmax.p)
+    st.info$Year<-substr(st.info$Time,1,4)
+    st.info$Month<-substr(st.info$Time,5,6)
+    st.info<-st.info[,-which(colnames(st.info)=="Time")]
+    
+    # Append storm info
+    storm_landfall<-rbind(storm_landfall,st.info)
+  }
+} 
+options(warn=0)
+
+# storm_landfall<-storm_landfall[m.dat
+
+# Add Hurricane category based on the Saffir-Simpson Hurricane Wind Scale
+brk<-c(-Inf,74,95,110,129,156,+Inf)
+storm_landfall$cat<-cut(storm_landfall$Max.Wind,breaks=brk,include.lowest=T,include.highest=T,  labels=c(0,1,2,3,4,5))
+# table(storm_landfall$cat)
+
+# Convert the category to numeric
+storm_landfall$cat=as.numeric(levels(storm_landfall$cat))[storm_landfall$cat]
+storm_landfall$Year=as.numeric(storm_landfall$Year)
+
+storm_landfall<-storm_landfall[storm_landfall$Max.Wind >= 75, ]
+
+# Let's visualise the resulting matrix with the landfall points
+head(storm_landfall)
+```
+
+# Landfall points map by category 
+
+
+```{r, message=F, warning=F, fig.width=10}
+
+geography <- list(
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  landcolor = toRGB("gray95"),
+  subunitcolor = toRGB("gray85"),
+  countrycolor = toRGB("gray85"),
+  countrywidth = 0.5,
+  subunitwidth = 0.5
+)
+
+storm_colors <- c("blue", "green", "yellow", "orange", "red")
+
+storm_plot <- plot_geo(storm_landfall, lat = ~y, lon = ~x) %>%
+  add_markers(
+   text = ~paste(Year,"<br />",Name,"<br />","Cat:",cat),hoverinfo="text",
+    color = ~storm_landfall$cat, size = ~storm_landfall$Max.Wind,
+   colors = storm_colors,
+    marker = list(colorbar = list(len = 0.2, title = "Landfall Category"))
+  ) %>%
+  layout(
+    title = 'US Hurricane Landfall points', geo = geography
+  )
+  
+storm_plot
+
+```
+
+```{r}
+
+# Plot a boxplot of the maximum wind speed at landfall
+storm_landfall1<-subset(storm_landfall,state.name %in% c("florida","louisiana","texas","mississippi", "alabama", "south carolina", "north carolina"))
+
+options(warn = -1) 
+storm_box <- plot_ly(storm_landfall1, y = ~Max.Wind, color = ~state.name, type = "box") %>%
+  layout(title='Max Wind speed at landfall', yaxis = list(title = 'Max Wind speed [mph]'))
+storm_box
+options(warn = 0) 
+
+```
