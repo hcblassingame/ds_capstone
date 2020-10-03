@@ -1,8 +1,9 @@
 ---
 title: "Hurricane Track & Intensity Investigation"
 author: "Henry Blassingame"
-date: "9/9/2020"
-output: html_document
+date: "02 OCTOBER 2020"
+output: 
+  html_document
 ---
 
 
@@ -27,27 +28,26 @@ library(tidyr)
 library(rgdal)
 library(rgeos)
 library(plotly)
+library(DALEX)
+library(auditor)
 
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
 ## Read and format input data
 ``` {r data loading and cleanup, echo=FALSE}
 # Read the data file.
 
-hurricane_data <- read.csv("atlantic_updated.csv", header = TRUE)
+options(warn=0)
+
+hurricane_data <- read.csv("atlantic_updated.csv", header = TRUE, colClasses = c("character", "character", "integer", "character", "character", "character", "integer", "numeric", "numeric", "integer", "integer", "integer", "integer", "integer", "integer", "integer",  "integer", "integer", "integer", "integer", "integer", "integer", "integer"))
 
 # The date and time data is a mess. Let's reformat it into one field:
 
-hurricane_data$Year <- substr(as.character(hurricane_data$Date), 1,4)
+hurricane_data$Year <- as.numeric(substr(as.character(hurricane_data$Date), 1,4))
 hurricane_data$Month <- substr(as.character(hurricane_data$Date), 5,6)
 hurricane_data$Day <- substr(as.character(hurricane_data$Date), 7,8)
-
+hurricane_data$ID <- as.character(hurricane_data$ID)
 hurricane_data$dateString <- as.Date(paste(hurricane_data$Month, hurricane_data$Day, hurricane_data$Year, sep = "/"), "%m/%d/%Y")
 hurricane_data$timestamp <- as.POSIXct(paste(hurricane_data$dateString, hurricane_data$Time), format = "%Y-%m-%d %H:%M")
 
@@ -56,18 +56,30 @@ coordinates<-cbind(coordinates, hurricane_data$Latitude)
 out<-subset(coordinates, hurricane_data$Longitude < -100) ##Find the outliers
 
 # Exclude data before 1900
-hurricane_data.new <- hurricane_data[hurricane_data$Year >= 1900,]
+# hurricane_data.new <- hurricane_data[,Year >= 1900]
+hurricane_data.new <- hurricane_data %>% filter(Year >= 1900)
 hurricane_data.new$YYYYMM<-as.numeric(do.call(paste, c(hurricane_data.new[c("Year", "Month")], sep = ""))) 
 # Exclude storms with only one record
 hurricane_data.new<-hurricane_data.new[ave(rep(1, nrow(hurricane_data.new)), hurricane_data.new$ID, FUN=length)>1,] 
 
-# define and remove the columns we don't need
-cruft <- c("Date", "dateString", "Event", "Status", "Category", "Minimum.Pressure",  "Low.Wind.NE", "Low.Wind.SE","Low.Wind.SW", "Low.Wind.NW", "Moderate.Wind.NE", "Moderate.Wind.SE","Moderate.Wind.SW", "Moderate.Wind.NW", "High.Wind.NE", "High.Wind.SE","High.Wind.SW", "High.Wind.NW",  "Day")
+# Replace any NA values in Category with 0
+hurricane_data.new$Category [is.na(hurricane_data.new$Category)]  <- 0
 
-trimmed_data <- hurricane_data.new[,!(names(hurricane_data) %in% cruft)]
+# define and remove the columns we don't need
+cruft <- c("Date", "dateString", "Event", "Status",    "Low.Wind.NE", "Low.Wind.SE","Low.Wind.SW", "Low.Wind.NW", "Moderate.Wind.NE", "Moderate.Wind.SE","Moderate.Wind.SW", "Moderate.Wind.NW", "High.Wind.NE", "High.Wind.SE","High.Wind.SW", "High.Wind.NW",  "Day")
+
+
+trimmed_data <- (hurricane_data.new[,!(names(hurricane_data.new) %in% cruft)])
+trimmed_data$Category [is.na(trimmed_data$Category)]  <- 0
+trimmed_data$storm_num  <- as.numeric(substr(trimmed_data$ID,3,4))
+
+# create training and test data sets for later on
+storm_partition <- createDataPartition(trimmed_data[,"ID"], times=1, p=.7, list=FALSE)
+train_set <- trimmed_data[storm_partition,]
+test_set <- trimmed_data[-storm_partition,]
 
 ```
-# Create a map of the US Coastline and plot landfall points
+##Create a map of the US Coastline and plot landfall points
 
 ```  {r data visualization, echo=FALSE}
 
@@ -154,12 +166,10 @@ for (i in 1:length(hurricane_data.ID)) {
 } 
 options(warn=0)
 
-# storm_landfall<-storm_landfall[m.dat
 
-# Add Hurricane category based on the Saffir-Simpson Hurricane Wind Scale
+# Add Hurricane category 
 brk<-c(-Inf,74,95,110,129,156,+Inf)
 storm_landfall$cat<-cut(storm_landfall$Max.Wind,breaks=brk,include.lowest=T,include.highest=T,  labels=c(0,1,2,3,4,5))
-# table(storm_landfall$cat)
 
 # Convert the category to numeric
 storm_landfall$cat=as.numeric(levels(storm_landfall$cat))[storm_landfall$cat]
@@ -167,13 +177,11 @@ storm_landfall$Year=as.numeric(storm_landfall$Year)
 
 storm_landfall<-storm_landfall[storm_landfall$Max.Wind >= 75, ]
 
-# Let's visualise the resulting matrix with the landfall points
+# Visualise the resulting matrix with the landfall points
 head(storm_landfall)
 ```
 
-# Landfall points map by category 
-
-
+## Map Hurricane Landfall Points
 ```{r, message=F, warning=F, fig.width=10}
 
 geography <- list(
@@ -204,15 +212,58 @@ storm_plot
 
 ```
 
+## Boxplot of the maximum wind speed at landfall for selected states
+
 ```{r}
 
-# Plot a boxplot of the maximum wind speed at landfall
+
 storm_landfall1<-subset(storm_landfall,state.name %in% c("florida","louisiana","texas","mississippi", "alabama", "south carolina", "north carolina"))
 
 options(warn = -1) 
 storm_box <- plot_ly(storm_landfall1, y = ~Max.Wind, color = ~state.name, type = "box") %>%
   layout(title='Max Wind speed at landfall', yaxis = list(title = 'Max Wind speed [mph]'))
 storm_box
-options(warn = 0) 
 
 ```
+
+## Plot of storms by Category 
+### This looked better in Tableau than I could have made it in R, so I am reusing this reom my last project.
+
+[Plot of Hurricanes by Year and Category](https://public.tableau.com/views/HurricaneData_15971058287080/StormsbyCategoryYear?:language=en&:display_count=y&:origin=viz_share_link)
+
+
+## Test of Random Forest vs. Linear Regression to predict number of storms per year
+``` {r}
+# test linear regression against random forest
+lm_model <- lm(storm_num ~ Time+Category+Latitude+Longitude+Maximum.Wind+Year+Month+timestamp , data = train_set)
+
+rf_model = randomForest(storm_num ~ Category+Latitude+Longitude+Maximum.Wind+Year+Month+timestamp, data = train_set, ntree = 5)
+
+test_set$scores = predict(rf_model, newdata = test_set)
+
+summary(test_set)
+
+#get residuals
+lm_exp <- DALEX::explain(lm_model, label = "lm", data = train_set, y = train_set$storm_num)
+rf_exp <- DALEX::explain(rf_model, label = "rf", data = train_set, y = train_set$storm_num)
+
+lm_mr <- model_residual(lm_exp)
+rf_mr <- model_residual(rf_exp)
+
+# Compare accuracy of Random Forest vs. Linear Regression. Random Forest is more accurate
+plot(rf_mr, lm_mr, type = "prediction", abline = TRUE)
+
+
+predictions <- rf_model %>% predict(test_set)
+RMSE <-  RMSE(predictions, test_set$storm_num)
+R2 <- R2(predictions, test_set$storm_num)
+
+# Print Root Mean Square Error of the prediction
+RMSE
+
+# Print R-Squared
+R2
+
+```
+
+
